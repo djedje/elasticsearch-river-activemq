@@ -1,31 +1,43 @@
 /*
- * Licensed to ElasticSearch under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership. ElasticSearch licenses this
- * file to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+* Licensed to ElasticSearch under one
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership. ElasticSearch licenses this
+* file to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*    http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
 
 package org.elasticsearch.river.activemq;
 
-import org.apache.activemq.ActiveMQConnection;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import javax.jms.Connection;
+import javax.jms.ConnectionFactory;
+import javax.jms.Destination;
+import javax.jms.JMSException;
+import javax.jms.Message;
+import javax.jms.MessageConsumer;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+import javax.jms.Topic;
 import org.apache.activemq.ActiveMQConnectionFactory;
-import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.bulk.BulkRequestBuilder;
+import org.elasticsearch.action.bulk.BulkProcessor;
+import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.client.Client;
-import org.elasticsearch.common.collect.Lists;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
@@ -35,55 +47,54 @@ import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
 import org.elasticsearch.river.RiverSettings;
 
-import javax.jms.*;
-import java.util.List;
-import java.util.Map;
-
 /**
  * &quot;Native&quot; ActiveMQ River for ElasticSearch.
  *
  * @author Dominik Dorn // http://dominikdorn.com
-  */
+ */
 public class ActiveMQRiver extends AbstractRiverComponent implements River {
-
-    public final String defaultActiveMQUser = ActiveMQConnection.DEFAULT_USER;
-    public final String defaultActiveMQPassword = ActiveMQConnection.DEFAULT_PASSWORD;
-    public final String defaultActiveMQBrokerUrl = ActiveMQConnection.DEFAULT_BROKER_URL;
+    
+    public final String defaultActiveMQUser = ActiveMQConnectionFactory.DEFAULT_USER;
+    public final String defaultActiveMQPassword = ActiveMQConnectionFactory.DEFAULT_PASSWORD;
+    public final String defaultActiveMQBrokerUrl = ActiveMQConnectionFactory.DEFAULT_BROKER_URL;
     public static final String defaultActiveMQSourceType = "queue"; // topic
     public static final String defaultActiveMQSourceName = "elasticsearch";
+    
+    public static final String DEFAULT_TYPE = "messageLost";
+    public static final String DEFAULT_INDEX = "lost";
     public final String defaultActiveMQConsumerName;
     public final boolean defaultActiveMQCreateDurableConsumer = false;
     public final String defaultActiveMQTopicFilterExpression = "";
-
-    private String activeMQUser;
-    private String activeMQPassword;
-    private String activeMQBrokerUrl;
+    
+    private final String activeMQUser;
+    private final String activeMQPassword;
+    private final String activeMQBrokerUrl;
     private String activeMQSourceType;
     private String activeMQSourceName;
     private String activeMQConsumerName;
     private boolean activeMQCreateDurableConsumer;
     private String activeMQTopicFilterExpression;
-
-
+    
+    
     private final Client client;
-
+    
     private final int bulkSize;
     private final TimeValue bulkTimeout;
     private final boolean ordered;
-
-    private volatile boolean closed = false;
-
+    
+    private volatile boolean isRiverOpened = false;
+    
     private volatile Thread thread;
-
-    private volatile ConnectionFactory connectionFactory;
-
+    
+    private ExecutorService executor;
+    
     @SuppressWarnings({"unchecked"})
     @Inject
     public ActiveMQRiver(RiverName riverName, RiverSettings settings, Client client) {
         super(riverName, settings);
         this.client = client;
         this.defaultActiveMQConsumerName = "activemq_elasticsearch_river_" + riverName().name();
-
+        
         if (settings.settings().containsKey("activemq")) {
             Map<String, Object> activeMQSettings = (Map<String, Object>) settings.settings().get("activemq");
             activeMQUser = XContentMapValues.nodeStringValue(activeMQSettings.get("user"), defaultActiveMQUser);
@@ -97,7 +108,7 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
             activeMQConsumerName = XContentMapValues.nodeStringValue(activeMQSettings.get("consumerName"), defaultActiveMQConsumerName);
             activeMQCreateDurableConsumer = XContentMapValues.nodeBooleanValue(activeMQSettings.get("durable"), defaultActiveMQCreateDurableConsumer);
             activeMQTopicFilterExpression = XContentMapValues.nodeStringValue(activeMQSettings.get("filter"), defaultActiveMQTopicFilterExpression);
-
+            
         } else {
             activeMQUser = (defaultActiveMQUser);
             activeMQPassword = (defaultActiveMQPassword);
@@ -108,7 +119,7 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
             activeMQCreateDurableConsumer = defaultActiveMQCreateDurableConsumer;
             activeMQTopicFilterExpression = defaultActiveMQTopicFilterExpression;
         }
-
+        
         if (settings.settings().containsKey("index")) {
             Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
             bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
@@ -124,8 +135,8 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
             ordered = false;
         }
     }
-
-
+    
+    
     @Override
     public void start() {
         logger.info("Creating an ActiveMQ river: user [{}], broker [{}], sourceType [{}], sourceName [{}]",
@@ -134,257 +145,168 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
                 activeMQSourceType,
                 activeMQSourceName
         );
-        connectionFactory = new ActiveMQConnectionFactory(activeMQUser, activeMQPassword, activeMQBrokerUrl);
-
-        thread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "activemq_river").newThread(new Consumer());
-        thread.start();
+        isRiverOpened = true;
+        ConnectionFactory connectionFactory = new ActiveMQConnectionFactory(activeMQUser, activeMQPassword, activeMQBrokerUrl);
+        ThreadFactory daemonThreadFactory = EsExecutors.daemonThreadFactory(settings.globalSettings(), "activemq_river");
+        //TODO voir si c'est judicieux le ThreadExecutor
+        //TODO se faire injecter un ThreadPool géré par ES directement à l'instanciation de la River comme la River Twitter.
+        executor = Executors.newSingleThreadExecutor(daemonThreadFactory);
+        executor.submit(new Consumer(connectionFactory, activeMQConsumerName));
     }
-
+    
+    
     @Override
     public void close() {
-        if (closed) {
+        if (!isRiverOpened) {
             return;
         }
-        logger.info("Closing the ActiveMQ river");
-        closed = true;
-        thread.interrupt();
+        logger.info("Closing ActiveMQ river");
+        isRiverOpened = false;
+        //TODO flush remaining message before shutdown
+        executor.shutdown();
+        
     }
-
+    
     private class Consumer implements Runnable {
-
+        
         private Connection connection;
-
-        private Session session;
-        private Destination destination;
-
+        private final ConnectionFactory connectionFactory;
+        private final String consumerName;
+        
+        private Consumer(ConnectionFactory connectionFactory, String consumerName) {
+            this.connectionFactory = connectionFactory;
+            this.consumerName = consumerName;
+        }
+        
         @Override
         public void run() {
-            while (true) {
-                if (closed) {
-                    break;
-                }
+            while (isRiverOpened) {
+                
                 try {
                     connection = connectionFactory.createConnection();
-                    connection.setClientID(activeMQConsumerName);
-                    session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-                    if (activeMQSourceType.equals("queue")) {
-                        destination = session.createQueue(activeMQSourceName);
-                    } else {
-                        destination = session.createTopic(activeMQSourceName);
-                    }
-                } catch (Exception e) {
-                    if (!closed) {
-                        logger.warn("failed to created a connection / channel", e);
-                    } else {
-                        continue;
-                    }
-                    cleanup(0, "failed to connect");
-                    try {
-                        Thread.sleep(5000);
-                    } catch (InterruptedException e1) {
-                        // ignore, if we are closing, we will exit later
-                    }
-                }
-
-
-                // define the queue
-                MessageConsumer consumer;
-                try {
-                    if (activeMQCreateDurableConsumer && activeMQSourceType.equals("topic")) {
-                        if (!"".equals(activeMQTopicFilterExpression)) {
-                            consumer = session.createDurableSubscriber(
-                                    (Topic) destination, // topic name
-                                    activeMQConsumerName, // consumer name
-                                    activeMQTopicFilterExpression, // filter expression
-                                    true // ?? TODO - lookup java doc as soon as network connection is back.
-                            );
-                        } else {
-                            consumer = session.createDurableSubscriber((Topic) destination, activeMQConsumerName);
-                        }
-                    } else {
-//                        consumer = session.createConsumer(destination, activeMQConsumerName);
-                        consumer = session.createConsumer(destination);
-                    }
-
-                } catch (Exception e) {
-                    if (!closed) {
-                        logger.warn("failed to create queue/topic [{}]", e, activeMQSourceName);
-                    }
-                    cleanup(0, "failed to create queue");
-                    continue;
-                }
-
-                try {
+                    //TODO if no operation but error on connection set ExceptionListener
+                    // connection.setExceptionListener(null);
+                    
+                    connection.setClientID(consumerName);
                     connection.start();
-                } catch (JMSException e) {
-                    cleanup(5, "failed to start connection");
-                }
-
-
-                // now use the queue/topic to listen for messages
-                while (true) {
-                    if (closed) {
-                        break;
-                    }
-                    Message message;
-                    try {
-                        message = consumer.receive();
-                        logger.debug("got a message [{}]", message);
-                    } catch (Exception e) {
-                        if (!closed) {
-                            logger.error("failed to get next message, reconnecting...", e);
-                        }
-                        cleanup(0, "failed to get message");
-                        break;
-                    }
-                    logger.debug("check if message is of type textmessage");
-                    if (message != null && message instanceof TextMessage) {
-                        logger.debug("it is of type textmessage");
-                        final List<String> deliveryTags = Lists.newArrayList();
-
-                        byte[] msgContent;
-                        try {
-                            TextMessage txtMessage = (TextMessage) message;
-
-                            msgContent = txtMessage.getText().getBytes();
-                            logger.debug("message was [{}]", txtMessage.getText());
-
-                        } catch (Exception e) {
-//                                logger.warn("failed to parse request for delivery tag [{}], ack'ing...", e, task.getJMSCorrelationID() );
-//                                try {
-//                                    channel.basicAck(task.getEnvelope().getDeliveryTag(), false);
-//                                } catch (IOException e1) {
-//                                    logger.warn("failed to ack [{}]", e1, task.getEnvelope().getDeliveryTag());
-//                                }
+                    
+                    final boolean isTransacted = false;
+                    Session session = connection.createSession(isTransacted, Session.AUTO_ACKNOWLEDGE);
+                    
+                    Destination destination = createDestination(session);
+                    
+                    MessageConsumer consumer = createConsumer(session, destination);
+                    //TODO If auto acknowledge create BulkProcessor Listener
+                    BulkProcessor bulkProcessor = createBulkProcessor();
+                    while(isRiverOpened) {
+                        Message message = consumer.receive(); // synchronous receive // TODO asynchronous message with MessageListener ?
+                        if (!(message instanceof TextMessage)) {
+                            //TODO message type not supported, skip it
                             continue;
                         }
-
-                        logger.debug("preparing bulk");
-                        BulkRequestBuilder bulkRequestBuilder = client.prepareBulk();
-                        logger.debug("bulk prepared.. ");
-
-                        try {
-                            logger.debug("adding message to bulkRequestBuilder");
-                            bulkRequestBuilder.add(msgContent, 0, msgContent.length, false);
-                            logger.debug("added message to bulkRequestBuilder");
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                        }
-
-                        logger.debug("adding deliveryTags");
-                        try {
-                            deliveryTags.add(message.getJMSMessageID());
-                        } catch (JMSException e) {
-                            logger.warn("failed to get JMS Message ID", e);
-                        }
-
-                        logger.debug("checking if numberOfActions [{}] < bulkSize [{}]", bulkRequestBuilder.numberOfActions(), bulkSize);
-                        if (bulkRequestBuilder.numberOfActions() < bulkSize) {
-                            logger.debug("it is..");
-                            // try and spin some more of those without timeout, so we have a bigger bulk (bounded by the bulk size)
-                            try {
-//                                    while ((message = consumer.receive(bulkTimeout.millis())) != null) {
-                                logger.debug("trying to get more messages, waiting 2000l ");
-                                while ((message = consumer.receive(bulkTimeout.millis())) != null) {
-                                    try {
-                                        byte[] content = ((TextMessage) message).getText().getBytes();
-                                        bulkRequestBuilder.add(content, 0, content.length, false);
-                                        deliveryTags.add(message.getJMSMessageID());
-                                    } catch (Exception e) {
-                                        logger.warn("failed to parse request for delivery tag [{}], ack'ing...", e, message.getJMSMessageID());
-//                                            try {
-//                                                channel.basicAck(task.getEnvelope().getDeliveryTag(), false);
-//                                            } catch (Exception e1) {
-//                                                logger.warn("failed to ack on failure [{}]", e1, task.getEnvelope().getDeliveryTag());
-//                                            }
-                                    }
-                                    if (bulkRequestBuilder.numberOfActions() >= bulkSize) {
-                                        break;
-                                    }
-                                }
-//                                } catch (InterruptedException e) {
-//                                    if (closed) {
-//                                        break;
-//                                    }
-                            } catch (JMSException e) {
-                                logger.warn("caught an exception [{}]", e);
-                                e.printStackTrace();
-                            }
-                        }
-
-                        if (logger.isTraceEnabled()) {
-                            logger.trace("executing bulk with [{}] actions", bulkRequestBuilder.numberOfActions());
-                        }
-
-                        logger.debug("if is ordered... ");
-                        if (ordered) {
-                            logger.debug("it is ordered.. ");
-                            try {
-                                BulkResponse response = bulkRequestBuilder.execute().actionGet();
-                                if (response.hasFailures()) {
-                                    // TODO write to exception queue?
-                                    logger.warn("failed to execute" + response.buildFailureMessage());
-                                }
-                                for (String deliveryTag : deliveryTags) {
-//                                        try {
-//                                            channel.basicAck(deliveryTag, false);
-//                                        } catch (Exception e1) {
-//                                            logger.warn("failed to ack [{}]", e1, deliveryTag);
-//                                        }
-                                }
-                            } catch (Exception e) {
-                                logger.warn("failed to execute bulk", e);
-                            }
-                        } else {
-                            bulkRequestBuilder.execute(new ActionListener<BulkResponse>() {
-                                @Override
-                                public void onResponse(BulkResponse response) {
-                                    if (response.hasFailures()) {
-                                        // TODO write to exception queue?
-                                        logger.warn("failed to execute" + response.buildFailureMessage());
-                                    }
-                                    for (String deliveryTag : deliveryTags) {
-//                                            try {
-//                                                channel.basicAck(deliveryTag, false);
-//                                            } catch (Exception e1) {
-//                                                logger.warn("failed to ack [{}]", e1, deliveryTag);
-//                                            }
-                                    }
-                                }
-
-                                @Override
-                                public void onFailure(Throwable e) {
-                                    logger.warn("failed to execute bulk for delivery tags [{}], not ack'ing", e, deliveryTags);
-                                }
-                            });
-                        }
-                    } else {
-                        logger.warn("Validation failed: message is not of type TextMessage");
+                        
+                        TextMessage txtMessage = (TextMessage) message;
+                        sendIntoES(txtMessage, bulkProcessor);
                     }
+                    bulkProcessor.close(); // flushing
+                    
+                } catch (JMSException e) {
+                    cleanup(connection, "failed to connect");
+                    //reconnect
                 }
             }
-            cleanup(0, "closing river");
+            cleanup(connection, "closing river");
+            
         }
-
-        private void cleanup(int code, String message) {
-            try {
-                session.close();
-            } catch (Exception e) {
-                logger.debug("failed to close session on [{}]", e, message);
+        
+        private Destination createDestination(Session session) throws JMSException {
+            return (activeMQSourceType.equals("queue")) ?
+                    session.createQueue(activeMQSourceName) :
+                    session.createTopic(activeMQSourceName);
+        }
+        
+        private MessageConsumer createConsumer(Session session, Destination destination) throws JMSException {
+            MessageConsumer consumer;
+            if (activeMQCreateDurableConsumer && activeMQSourceType.equals("topic")) {
+                if (!"".equals(activeMQTopicFilterExpression)) {
+                    consumer = session.createDurableSubscriber(
+                            (Topic) destination, // topic name
+                            activeMQConsumerName, // consumer name
+                            activeMQTopicFilterExpression, // filter expression
+                            true // ?? TODO - lookup java doc as soon as network connection is back.
+                    );
+                } else {
+                    consumer = session.createDurableSubscriber((Topic) destination, activeMQConsumerName);
+                }
+            } else {
+                consumer = session.createConsumer(destination);
             }
-
+            return consumer;
+        }
+        
+        private BulkProcessor createBulkProcessor() {
+            BulkProcessor bulkProcessor = BulkProcessor.builder(client,
+                    new BulkProcessor.Listener() {
+                        
+                        @Override
+                        public void beforeBulk(long executionId,
+                                BulkRequest request) {
+                            logger.info("Going to execute new bulk composed of {} actions",
+                                    request.numberOfActions());
+                        }
+                        
+                        @Override
+                        public void afterBulk(long executionId,
+                                BulkRequest request,
+                                BulkResponse response) {
+                            logger.info("Executed bulk composed of {} actions",
+                                    request.numberOfActions());
+                            for (Object payload : request.payloads()) {
+                                if (payload == null) {
+                                    continue;
+                                }
+                                Message jmsMessage = (Message) payload;
+                                try {
+                                    logger.info("Jms Message send {}", jmsMessage.getJMSMessageID());
+                                    jmsMessage.acknowledge(); // TODO !! ahah
+                                } catch (JMSException ex) {
+                                }
+                            }
+                        }
+                        
+                        @Override
+                        public void afterBulk(long executionId,
+                                BulkRequest request,
+                                Throwable failure) {
+                            logger.warn("Error executing bulk", failure);
+                        }
+                    }).setBulkActions(bulkSize).setFlushInterval(bulkTimeout).build();
+            //TODO Take care of ordered field  value to set concurrent bulkprocessors
+            
+            return bulkProcessor;
+        }
+        
+        private void sendIntoES(TextMessage message, BulkProcessor bulkProcessor) {
+            
             try {
-                connection.stop();
+                String content = message.getText();
+                bulkProcessor.add(new BytesArray(content), false, DEFAULT_INDEX, DEFAULT_TYPE);
             } catch (JMSException e) {
-                logger.debug("failed to stop connection on [{}]", e);
+                //TODO Unable to extract content from message
+                return;
+            } catch (Exception ex) {
+                //TODO Unable to parse Bulk action or message; skip it.
             }
-
+        }
+        
+        
+        private void cleanup(Connection connection, String message) {
             try {
                 connection.close();
-            } catch (Exception e) {
+            } catch (JMSException e) {
                 logger.debug("failed to close connection on [{}]", e, message);
             }
         }
     }
-
+    
 }
