@@ -22,7 +22,6 @@ package org.elasticsearch.river.activemq;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
 import javax.jms.Connection;
 import javax.jms.ConnectionFactory;
 import javax.jms.Destination;
@@ -34,13 +33,13 @@ import javax.jms.TextMessage;
 import javax.jms.Topic;
 import org.apache.activemq.ActiveMQConnectionFactory;
 import org.elasticsearch.action.bulk.BulkProcessor;
+import org.elasticsearch.action.bulk.BulkProcessor.Builder;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.river.AbstractRiverComponent;
 import org.elasticsearch.river.River;
@@ -54,14 +53,15 @@ import org.elasticsearch.river.RiverSettings;
  */
 public class ActiveMQRiver extends AbstractRiverComponent implements River {
     
-    public final String defaultActiveMQUser = ActiveMQConnectionFactory.DEFAULT_USER;
-    public final String defaultActiveMQPassword = ActiveMQConnectionFactory.DEFAULT_PASSWORD;
-    public final String defaultActiveMQBrokerUrl = ActiveMQConnectionFactory.DEFAULT_BROKER_URL;
-    public static final String defaultActiveMQSourceType = "queue"; // topic
-    public static final String defaultActiveMQSourceName = "elasticsearch";
+    public static final String DEFAULT_ACTIVEMQ_SOURCE_TYPE = "queue"; // topic
+    public static final String DEFAULT_ACTIVEMQ_SOURCE_NAME = "elasticsearch";
+    public static final String DEFAULT_TYPE = "unknown_type";
+    public static final String DEFAULT_INDEX = "unknown_index";
+    public static final int DEFAULT_CONCURRENT_REQUESTS = 5;
     
-    public static final String DEFAULT_TYPE = "messageLost";
-    public static final String DEFAULT_INDEX = "lost";
+    public static final String defaultActiveMQUser = ActiveMQConnectionFactory.DEFAULT_USER;
+    public static final String defaultActiveMQPassword = ActiveMQConnectionFactory.DEFAULT_PASSWORD;
+    public static final String defaultActiveMQBrokerUrl = ActiveMQConnectionFactory.DEFAULT_BROKER_URL;
     public final String defaultActiveMQConsumerName;
     public final boolean defaultActiveMQCreateDurableConsumer = false;
     public final String defaultActiveMQTopicFilterExpression = "";
@@ -69,22 +69,19 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
     private final String activeMQUser;
     private final String activeMQPassword;
     private final String activeMQBrokerUrl;
+    
     private String activeMQSourceType;
     private String activeMQSourceName;
     private String activeMQConsumerName;
     private boolean activeMQCreateDurableConsumer;
     private String activeMQTopicFilterExpression;
     
-    
     private final Client client;
     
     private final int bulkSize;
     private final TimeValue bulkTimeout;
     private final boolean ordered;
-    
     private volatile boolean isRiverOpened = false;
-    
-    private volatile Thread thread;
     
     private ExecutorService executor;
     
@@ -100,11 +97,11 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
             activeMQUser = XContentMapValues.nodeStringValue(activeMQSettings.get("user"), defaultActiveMQUser);
             activeMQPassword = XContentMapValues.nodeStringValue(activeMQSettings.get("pass"), defaultActiveMQPassword);
             activeMQBrokerUrl = XContentMapValues.nodeStringValue(activeMQSettings.get("brokerUrl"), defaultActiveMQBrokerUrl);
-            activeMQSourceType = XContentMapValues.nodeStringValue(activeMQSettings.get("sourceType"), defaultActiveMQSourceType);
+            activeMQSourceType = XContentMapValues.nodeStringValue(activeMQSettings.get("sourceType"), DEFAULT_ACTIVEMQ_SOURCE_TYPE);
             activeMQSourceType = activeMQSourceType.toLowerCase();
             if (!"queue".equals(activeMQSourceType) && !"topic".equals(activeMQSourceType))
                 throw new IllegalArgumentException("Specified an invalid source type for the ActiveMQ River. Please specify either 'queue' or 'topic'");
-            activeMQSourceName = XContentMapValues.nodeStringValue(activeMQSettings.get("sourceName"), defaultActiveMQSourceName);
+            activeMQSourceName = XContentMapValues.nodeStringValue(activeMQSettings.get("sourceName"), DEFAULT_ACTIVEMQ_SOURCE_NAME);
             activeMQConsumerName = XContentMapValues.nodeStringValue(activeMQSettings.get("consumerName"), defaultActiveMQConsumerName);
             activeMQCreateDurableConsumer = XContentMapValues.nodeBooleanValue(activeMQSettings.get("durable"), defaultActiveMQCreateDurableConsumer);
             activeMQTopicFilterExpression = XContentMapValues.nodeStringValue(activeMQSettings.get("filter"), defaultActiveMQTopicFilterExpression);
@@ -113,8 +110,8 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
             activeMQUser = (defaultActiveMQUser);
             activeMQPassword = (defaultActiveMQPassword);
             activeMQBrokerUrl = (defaultActiveMQBrokerUrl);
-            activeMQSourceType = (defaultActiveMQSourceType);
-            activeMQSourceName = (defaultActiveMQSourceName);
+            activeMQSourceType = (DEFAULT_ACTIVEMQ_SOURCE_TYPE);
+            activeMQSourceName = (DEFAULT_ACTIVEMQ_SOURCE_NAME);
             activeMQConsumerName = defaultActiveMQConsumerName;
             activeMQCreateDurableConsumer = defaultActiveMQCreateDurableConsumer;
             activeMQTopicFilterExpression = defaultActiveMQTopicFilterExpression;
@@ -147,10 +144,7 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
         );
         isRiverOpened = true;
         ConnectionFactory connectionFactory = new ActiveMQConnectionFactory(activeMQUser, activeMQPassword, activeMQBrokerUrl);
-        ThreadFactory daemonThreadFactory = EsExecutors.daemonThreadFactory(settings.globalSettings(), "activemq_river");
-        //TODO voir si c'est judicieux le ThreadExecutor
-        //TODO se faire injecter un ThreadPool géré par ES directement à l'instanciation de la River comme la River Twitter.
-        executor = Executors.newSingleThreadExecutor(daemonThreadFactory);
+        executor = Executors.newSingleThreadExecutor();
         executor.submit(new Consumer(connectionFactory, activeMQConsumerName));
     }
     
@@ -162,7 +156,6 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
         }
         logger.info("Closing ActiveMQ river");
         isRiverOpened = false;
-        //TODO flush remaining message before shutdown
         executor.shutdown();
         
     }
@@ -180,43 +173,42 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
         
         @Override
         public void run() {
-            while (isRiverOpened) {
+            while (isRiverOpened && !Thread.currentThread().isInterrupted()) {
                 
+                BulkProcessor bulkProcessor = null;
                 try {
                     connection = connectionFactory.createConnection();
-                    //TODO if no operation but error on connection set ExceptionListener
-                    // connection.setExceptionListener(null);
-                    
                     connection.setClientID(consumerName);
                     connection.start();
                     
                     final boolean isTransacted = false;
-                    Session session = connection.createSession(isTransacted, Session.AUTO_ACKNOWLEDGE);
+                    Session session = connection.createSession(isTransacted, Session.CLIENT_ACKNOWLEDGE); 
                     
                     Destination destination = createDestination(session);
                     
                     MessageConsumer consumer = createConsumer(session, destination);
-                    //TODO If auto acknowledge create BulkProcessor Listener
-                    BulkProcessor bulkProcessor = createBulkProcessor();
+                    bulkProcessor = createBulkProcessor();
                     while(isRiverOpened) {
-                        Message message = consumer.receive(); // synchronous receive // TODO asynchronous message with MessageListener ?
+                        Message message = consumer.receive(); 
                         if (!(message instanceof TextMessage)) {
-                            //TODO message type not supported, skip it
+                            logger.info("Message type [{}] with ID [{}] not supported, skipped", message.getJMSMessageID(), message.getJMSType());
                             continue;
                         }
                         
                         TextMessage txtMessage = (TextMessage) message;
                         sendIntoES(txtMessage, bulkProcessor);
                     }
-                    bulkProcessor.close(); // flushing
+                    
                     
                 } catch (JMSException e) {
-                    cleanup(connection, "failed to connect");
-                    //reconnect
+                    logger.error("Error during JMS communication, reconnecting...", e.getMessage());
+                } finally {
+                    // flushing
+                    if (bulkProcessor != null) { bulkProcessor.close(); }
+                    cleanup();
                 }
             }
-            cleanup(connection, "closing river");
-            
+            logger.info("CLosing river...done");
         }
         
         private Destination createDestination(Session session) throws JMSException {
@@ -245,66 +237,68 @@ public class ActiveMQRiver extends AbstractRiverComponent implements River {
         }
         
         private BulkProcessor createBulkProcessor() {
-            BulkProcessor bulkProcessor = BulkProcessor.builder(client,
+            Builder builder = BulkProcessor.builder(client,
                     new BulkProcessor.Listener() {
                         
                         @Override
-                        public void beforeBulk(long executionId,
-                                BulkRequest request) {
-                            logger.info("Going to execute new bulk composed of {} actions",
-                                    request.numberOfActions());
+                        public void beforeBulk(long executionId, BulkRequest request) {
+                            logger.info("Going to execute new bulk composed of {} actions", request.numberOfActions());
                         }
                         
                         @Override
-                        public void afterBulk(long executionId,
-                                BulkRequest request,
-                                BulkResponse response) {
-                            logger.info("Executed bulk composed of {} actions",
-                                    request.numberOfActions());
+                        public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+                            logger.info("Executed bulk composed of {} actions", request.numberOfActions());
+                            acknowledgeMessages(request);
+                        }
+                        
+                        @Override
+                        public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
+                            logger.warn("Error executing bulk", failure);
+                        }
+                        
+                        private void acknowledgeMessages(BulkRequest request) {
                             for (Object payload : request.payloads()) {
                                 if (payload == null) {
                                     continue;
                                 }
                                 Message jmsMessage = (Message) payload;
                                 try {
-                                    logger.info("Jms Message send {}", jmsMessage.getJMSMessageID());
-                                    jmsMessage.acknowledge(); // TODO !! ahah
+                                    logger.info("JMS message with ID [{}] sent into ES", jmsMessage.getJMSMessageID());
+                                    jmsMessage.acknowledge();
                                 } catch (JMSException ex) {
+                                    logger.warn("Unable to perform reporting on JMS message after a successful BulkRequest", ex);
                                 }
                             }
                         }
-                        
-                        @Override
-                        public void afterBulk(long executionId,
-                                BulkRequest request,
-                                Throwable failure) {
-                            logger.warn("Error executing bulk", failure);
-                        }
-                    }).setBulkActions(bulkSize).setFlushInterval(bulkTimeout).build();
-            //TODO Take care of ordered field  value to set concurrent bulkprocessors
+
+                    }).setBulkActions(bulkSize).setFlushInterval(bulkTimeout);
             
-            return bulkProcessor;
+            if (!ordered) {
+                builder.setConcurrentRequests(DEFAULT_CONCURRENT_REQUESTS);
+            }
+            
+            return builder.build();
         }
         
         private void sendIntoES(TextMessage message, BulkProcessor bulkProcessor) {
-            
+            String messageId = null;
             try {
                 String content = message.getText();
-                bulkProcessor.add(new BytesArray(content), false, DEFAULT_INDEX, DEFAULT_TYPE);
+                messageId = message.getJMSMessageID();
+                bulkProcessor.add(new BytesArray(content), false, DEFAULT_INDEX, DEFAULT_TYPE, message);
             } catch (JMSException e) {
-                //TODO Unable to extract content from message
-                return;
+                logger.error("Unable to extract message content, message skipped");
             } catch (Exception ex) {
-                //TODO Unable to parse Bulk action or message; skip it.
+                logger.error("Unable to prepare ES request to send message with ID [{}], message skipped", messageId);
             }
         }
         
-        
-        private void cleanup(Connection connection, String message) {
+        private void cleanup() {
+            
             try {
                 connection.close();
             } catch (JMSException e) {
-                logger.debug("failed to close connection on [{}]", e, message);
+                logger.debug("Error during JMS failed to close JMS connection");
             }
         }
     }

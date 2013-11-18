@@ -19,6 +19,12 @@
 
 package org.elasticsearch.river.activemq;
 
+import java.io.IOException;
+import javax.jms.Connection;
+import javax.jms.JMSException;
+import javax.jms.MessageProducer;
+import javax.jms.Queue;
+import javax.jms.Session;
 import org.apache.activemq.ActiveMQConnectionFactory;
 import org.apache.activemq.broker.BrokerService;
 import org.apache.activemq.broker.TransportConnector;
@@ -26,16 +32,12 @@ import org.elasticsearch.action.ListenableActionFuture;
 import org.elasticsearch.action.get.GetResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.settings.ImmutableSettings;
+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 import org.elasticsearch.indices.IndexMissingException;
 import org.elasticsearch.node.Node;
 import org.elasticsearch.node.NodeBuilder;
 import org.junit.Assert;
 import org.junit.Test;
-
-import javax.jms.*;
-import java.io.IOException;
-
-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 
 /**
  * @author Dominik Dorn // http://dominikdorn.com
@@ -120,7 +122,7 @@ public class ActiveMQRiverTest {
 
 
         // connect to the ActiveMQ Broker and publish a message into the default queue
-        postMessageToQueue(ActiveMQRiver.defaultActiveMQSourceName, message);
+        postMessageToQueue(ActiveMQRiver.DEFAULT_ACTIVEMQ_SOURCE_NAME, message);
 
 
         Thread.sleep(3000l);
